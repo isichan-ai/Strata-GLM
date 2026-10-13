@@ -505,6 +505,7 @@ bool pread_full(int fd, uint8_t* dst, uint64_t n, uint64_t off) {
 int FileExpertSource::spans(int64_t layer, int64_t expert, Span* out) const {
     if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return 0;
     if (!role_ptr_.empty()) {
+        if (unmapped_) return 0;   // the GGUF views are closed (drop_mapping)
         uint64_t at = 0;
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * layer + r);
@@ -958,16 +959,17 @@ void FileExpertSource::close() {
     if (!maps_.empty()) {
         for (Map& m : maps_) {
 #if defined(_WIN32)
-            if (m.base != nullptr) UnmapViewOfFile((LPCVOID) m.base);
+            if (m.base != nullptr && !m.closed) UnmapViewOfFile((LPCVOID) m.base);
             if (m.mapping != nullptr) CloseHandle((HANDLE) m.mapping);
             if (m.file != nullptr) CloseHandle((HANDLE) m.file);
 #else
-            if (m.base != nullptr) munmap((void*) m.base, (size_t) m.bytes);
+            if (m.base != nullptr && !m.closed) munmap((void*) m.base, (size_t) m.bytes);
             if (m.fd >= 0) ::close(m.fd);
 #endif
         }
         maps_.clear();
         base_ = nullptr;   // one of the views above
+        unmapped_ = false;
     }
     role_ptr_.clear();
     role_bytes_.clear();
@@ -1153,6 +1155,7 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     }
 #endif
     if (!role_ptr_.empty()) {
+        if (unmapped_) return false;   // drop_mapping closed the GGUF views: only the unbuffered reads remain
         uint64_t at = 0;
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * layer + r);
@@ -1417,7 +1420,7 @@ void FileExpertSource::prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, 
 }
 
 bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
-    if (base_ == nullptr || !direct_.empty() || !strata::platform::read_ahead_enabled()) return false;
+    if (base_ == nullptr || unmapped_ || !direct_.empty() || !strata::platform::read_ahead_enabled()) return false;
     for (int64_t i = 0; pairs != nullptr && i < n; ++i) {
         const int64_t l = pairs[i].first, e = pairs[i].second;
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
@@ -1603,7 +1606,27 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
 bool FileExpertSource::drop_mapping(std::string& why) {
 #if defined(_WIN32)
     if (direct_.empty()) { why = "the reads are not unbuffered"; return false; }
-    if (!role_ptr_.empty() || !maps_.empty()) { why = "the GGUF in place keeps its maps (token embedding, PLE)"; return false; }
+    if (!role_ptr_.empty() || !maps_.empty()) {
+        // the GGUF in place: nothing in the engine reads the shards through these views any more (the token embedding is
+        // copied into pinned host memory at load, the dense weights and the head into VRAM, the PLE table has its own
+        // reader), so every shard goes: with one mapped, NTFS runs the unbuffered reads of that file one at a time
+        if (unmapped_) { why = "already closed"; return true; }
+        for (Map& m : maps_) {
+            if (m.closed) continue;
+            if (m.base != nullptr && !UnmapViewOfFile((LPCVOID) m.base)) { why = "UnmapViewOfFile failed"; return false; }
+            m.closed = true;   // m.base stays: the read offsets are taken from it
+            if (m.mapping != nullptr) CloseHandle((HANDLE) m.mapping);
+            m.mapping = nullptr;
+            if (m.file != nullptr) CloseHandle((HANDLE) m.file);
+            m.file = nullptr;
+        }
+        unmapped_ = true;
+        char note[160];
+        std::snprintf(note, sizeof note, "%zu GGUF shard%s unmapped; every expert outside RAM and VRAM is read unbuffered",
+                      maps_.size(), maps_.size() == 1 ? "" : "s");
+        why = note;
+        return true;
+    }
     if (base_ == nullptr || unmapped_) { why = base_ == nullptr ? "not open" : "already closed"; return unmapped_; }
     if (!UnmapViewOfFile((LPCVOID) base_)) { why = "UnmapViewOfFile failed"; return false; }
     unmapped_ = true;
@@ -1615,8 +1638,22 @@ bool FileExpertSource::drop_mapping(std::string& why) {
     why = "every expert outside RAM and VRAM is read unbuffered";
     return true;
 #else
-    why = "not Windows";
-    return false;
+    // Linux's page cache has no such lock: only the tests close the GGUF views (STRATA_TEST_UNMAP_GGUF=1), to run the
+    // unmapped path the Windows file tier takes
+    const char* t = std::getenv("STRATA_TEST_UNMAP_GGUF");
+    if (t == nullptr || t[0] == ' ' || std::atoi(t) == 0 || role_ptr_.empty()) { why = "not Windows"; return false; }
+    if (direct_.empty()) { why = "the reads are not unbuffered"; return false; }
+    if (unmapped_) { why = "already closed"; return true; }
+    for (Map& m : maps_) {
+        if (m.closed) continue;
+        if (m.base != nullptr && munmap((void*) m.base, (size_t) m.bytes) != 0) { why = "munmap failed"; return false; }
+        m.closed = true;
+        if (m.fd >= 0) ::close(m.fd);
+        m.fd = -1;
+    }
+    unmapped_ = true;
+    why = std::to_string(maps_.size()) + " GGUF shard(s) unmapped (STRATA_TEST_UNMAP_GGUF); every expert outside RAM and VRAM is read unbuffered";
+    return true;
 #endif
 }
 
@@ -1906,7 +1943,7 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
             if (io_ahead_) io_enqueue(layer, e);
             continue;
         }
-        if (role_ptr_.empty()) continue;
+        if (role_ptr_.empty() || unmapped_) continue;
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * layer + r);
             const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) e * role_bytes_[i]);
@@ -2147,7 +2184,7 @@ bool FileExpertSource::transient(int64_t layer, int64_t expert) const {
 
 double FileExpertSource::cached_share(int64_t samples) const {
 #if defined(__linux__)
-    if (role_ptr_.empty() || samples <= 0 || n_layers_ <= 0 || n_expert_ <= 0) return -1.0;
+    if (role_ptr_.empty() || unmapped_ || samples <= 0 || n_layers_ <= 0 || n_expert_ <= 0) return -1.0;
     // an even spread over the (layer, expert) grid, every page of each of the expert's three slices through mincore
     const int64_t total = (int64_t) n_layers_ * (int64_t) n_expert_;
     const int64_t n = std::min<int64_t>(samples, total);
@@ -2252,7 +2289,7 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
         const char* v = std::getenv("STRATA_FILE_RELEASE");
         return v != nullptr && std::strcmp(v, "1") == 0;
     }();
-    if (!enabled || base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
+    if (!enabled || base_ == nullptr || unmapped_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
         return 0;
     static const uint64_t page = [] {
         SYSTEM_INFO info{};
@@ -2483,7 +2520,7 @@ bool FileExpertSource::pin_cache_complement(
             if (fd >= 0) (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
         };
         if (maps_.empty()) drop(base_, mapped_bytes_, fd_);
-        else for (const Map& m : maps_) drop(m.base, m.bytes, m.fd);
+        else for (const Map& m : maps_) drop(m.closed ? nullptr : m.base, m.bytes, m.fd);
     };
 #endif
     if (bytes > 0) {
@@ -2856,8 +2893,9 @@ bool FileExpertSource::pin_cache_complement(
 #if defined(_WIN32)
     // The mapped pages this process touched (the GPU cache's fill and this copy) leave its working set for the
     // standby list: VirtualUnlock on pages that are not locked does exactly that (it then reports ERROR_NOT_LOCKED).
-    if (maps_.empty()) (void) VirtualUnlock((LPVOID) base_, (SIZE_T) mapped_bytes_);
-    for (const Map& m : maps_) (void) VirtualUnlock((LPVOID) m.base, (SIZE_T) m.bytes);
+    // Not with the view closed (begin_startup_unbuffered): its range may hold other memory by now.
+    if (maps_.empty() && !unmapped_) (void) VirtualUnlock((LPVOID) base_, (SIZE_T) mapped_bytes_);
+    for (const Map& m : maps_) if (!m.closed) (void) VirtualUnlock((LPVOID) m.base, (SIZE_T) m.bytes);
 #endif
 
     complement_arena_ = arena;

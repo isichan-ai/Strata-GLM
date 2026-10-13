@@ -718,6 +718,7 @@ private:
     struct Map {
         const uint8_t* base = nullptr;
         uint64_t bytes = 0;
+        bool closed = false;   ///< drop_mapping unmapped the view (base stays for offsets)
 #if defined(_WIN32)
         void* file = nullptr;
         void* mapping = nullptr;
