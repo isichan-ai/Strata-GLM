@@ -280,6 +280,9 @@ public:
         const uint8_t* (*ram)(void* ctx, int64_t layer, int64_t expert) = nullptr;
         /// 2026-10-10: a pointer no later lookup recycles (ExpertSource::blob_stable) - for threads that hold it
         const uint8_t* (*stable)(void* ctx, int64_t layer, int64_t expert) = nullptr;
+        /// 2026-10-13: ExpertSource::prefetch_async - the file tier read ahead unbuffered into the source's stage
+        /// buffers on its own thread (a later blob() of one still in flight waits for it)
+        void (*prefetch)(void* ctx, int64_t layer, const int64_t* experts, int64_t n) = nullptr;
     };
     /// The prompt's cells [pos0, pos0 + n) in chunks of `chunk` tokens, the state written as commits would (KDA state
     /// and conv history, the latent cache, the indexer pool).  Per layer the attention runs in slices of 8 tokens (the

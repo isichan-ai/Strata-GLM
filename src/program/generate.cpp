@@ -12568,6 +12568,7 @@ int main(int argc, char** argv) {
                 return fs != nullptr && fs->complement_ready() ? fs->resident_blob(l, e) : nullptr;
             };
             pf.stable = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob_stable(l, e); };
+            pf.prefetch = [](void* c, int64_t l, const int64_t* e, int64_t n) { ((strata::core::ExpertSource*) c)->prefetch_async(l, e, n); };
             // multinode (2026-10-08): each chunk through [0, K1) here, the stage engines' ranges, then [Kn, end) here
             std::vector<std::vector<float>> mn_hand;
             auto mn_prefill = [&](const int32_t* toks, int64_t n_tok, int64_t p0, std::string& e) -> bool {
@@ -13574,6 +13575,7 @@ int main(int argc, char** argv) {
                     return fs != nullptr && fs->complement_ready() ? fs->resident_blob(l, e) : nullptr;
                 };
                 pf.stable = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob_stable(l, e); };
+                pf.prefetch = [](void* c, int64_t l, const int64_t* e, int64_t n) { ((strata::core::ExpertSource*) c)->prefetch_async(l, e, n); };
                 if (ver.prefill_glm5(toks32.data(), np, 0, pf_chunk, pf, err)) {
                     std::fprintf(stderr, "strata generate: glm5 prefill %lld tokens in chunks of %d, %.1f ms (%.1f tok/s); "
                                          "experts streamed %lld, resident %lld, host copy submission %.1f ms\n",

@@ -63,7 +63,40 @@
 #endif
 #endif
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <emmintrin.h>
+#endif
+
 namespace strata::core {
+
+namespace {
+// 2026-10-14: a big copy whose destination is not read again soon (a blob assembled for the GPU): non-temporal stores
+// skip the read-for-ownership of every destination line, 3 -> 2 RAM transfers a byte.  Beside a DMA from RAM that
+// matters: 4 threads copying cost the DMA 46 -> 17 GB/s with memcpy, -> 26 GB/s with these.  STRATA_NT_COPY=0: memcpy.
+void big_copy(uint8_t* d, const uint8_t* s, size_t n) {
+#if defined(_M_X64) || defined(__x86_64__)
+    static const bool nt = [] { const char* v = std::getenv("STRATA_NT_COPY"); return v == nullptr || std::atoi(v) != 0; }();
+    if (nt && n >= (1u << 16)) {
+        const size_t head = (16 - ((uintptr_t) d & 15)) & 15;
+        std::memcpy(d, s, head);
+        d += head; s += head; n -= head;
+        const size_t body = n & ~(size_t) 63;
+        for (size_t i = 0; i < body; i += 64) {
+            const __m128i a = _mm_loadu_si128((const __m128i*) (s + i)), b = _mm_loadu_si128((const __m128i*) (s + i + 16));
+            const __m128i c = _mm_loadu_si128((const __m128i*) (s + i + 32)), e = _mm_loadu_si128((const __m128i*) (s + i + 48));
+            _mm_stream_si128((__m128i*) (d + i), a);
+            _mm_stream_si128((__m128i*) (d + i + 16), b);
+            _mm_stream_si128((__m128i*) (d + i + 32), c);
+            _mm_stream_si128((__m128i*) (d + i + 48), e);
+        }
+        _mm_sfence();
+        std::memcpy(d + body, s + body, n - body);
+        return;
+    }
+#endif
+    std::memcpy(d, s, n);
+}
+}  // namespace
 
 namespace detail {
 
@@ -977,6 +1010,8 @@ void FileExpertSource::close() {
     paths_.clear();
     for (void* h : direct_) close_direct(h);
     direct_.clear();
+    for (void* h : mirror_) close_direct(h);
+    mirror_.clear();
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         stage_buf_.clear();
@@ -1506,6 +1541,49 @@ uint64_t FileExpertSource::expert_bytes() const {
     return total;
 }
 
+void FileExpertSource::open_mirror(std::string& why) {
+#if defined(_WIN32)
+    // a copy of the shards on a second drive: each drive reads its share of every batch, so the file tier reads at the
+    // sum of the two (the copy is never mapped, so NTFS never serialises it either)
+    const char* dir = std::getenv("STRATA_MIRROR_DIR");
+    if (dir == nullptr || dir[0] == '\0' || !mirror_.empty()) return;
+    const char* sh = std::getenv("STRATA_MIRROR_SHARE");
+    const double share = sh != nullptr && sh[0] != '\0' ? std::atof(sh) : 0.5;
+    auto wide = [](const std::string& s) {
+        const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+        std::vector<wchar_t> w((size_t) (n > 0 ? n : 1), L'\0');
+        if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+        return w;
+    };
+    for (size_t i = 0; i < paths_.size(); ++i) {
+        const std::string& path = paths_[i];
+        const size_t cut = path.find_last_of("\\/");
+        const std::string copy = std::string(dir) + "\\" + (cut == std::string::npos ? path : path.substr(cut + 1));
+        HANDLE h = CreateFileW(wide(copy).data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
+        LARGE_INTEGER a{}, b{};
+        const bool same = h != INVALID_HANDLE_VALUE && GetFileSizeEx(h, &a) && GetFileSizeEx((HANDLE) direct_[i], &b) &&
+                          a.QuadPart == b.QuadPart;
+        if (!same) {
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            for (void* d : mirror_) CloseHandle((HANDLE) d);
+            mirror_.clear();
+            why += "; no mirror (" + copy + " missing or of another size)";
+            return;
+        }
+        mirror_.push_back(h);
+    }
+    mirror_share_ = (uint32_t) std::clamp(share * 1024.0, 0.0, 1024.0);
+    char note[96];
+    std::snprintf(note, sizeof note, "; mirror of %zu file%s, %.0f%% of the reads", mirror_.size(),
+                  mirror_.size() == 1 ? "" : "s", 100.0 * mirror_share_ / 1024.0);
+    why += note;
+    std::fprintf(stderr, "strata: file tier mirror %s (%s)\n", dir, note + 2);
+#else
+    (void) why;
+#endif
+}
+
 bool FileExpertSource::open_direct(std::string& why) {
 #if defined(_WIN32)
     for (const std::string& path : paths_) {
@@ -1523,6 +1601,7 @@ bool FileExpertSource::open_direct(std::string& why) {
         }
         direct_.push_back(h);
     }
+    open_mirror(why);
     if (role_ptr_.empty()) {   // experts.bin: blob() now assembles into the stage buffers, sized for the largest blob
         std::lock_guard<std::mutex> lk(stage_mu_);
         for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
@@ -1596,6 +1675,8 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
     // through the file cache after all: the mapped reads take over (staged() stays true for the GGUF in place)
     for (void* d : direct_) close_direct(d);
     direct_.clear();
+    for (void* d : mirror_) close_direct(d);
+    mirror_.clear();
     return false;
 #else
     why = "through the file cache (no unbuffered reads on this platform)";
@@ -1727,7 +1808,12 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 continue;
             }
         }
-        sc.req.push_back({(HANDLE) direct_[(size_t) x.file], x.a0, x.size, total});
+        HANDLE h = (HANDLE) direct_[(size_t) x.file];
+        if (!mirror_.empty()) {   // STRATA_MIRROR_DIR: the hash of the offset picks the drive, so both see every batch
+            const uint64_t k = ((x.a0 >> 20) + (uint64_t) x.file * 0x10001ull) * 0x9E3779B97F4A7C15ull;
+            if ((uint32_t) (k >> 54) < mirror_share_) h = (HANDLE) mirror_[(size_t) x.file];
+        }
+        sc.req.push_back({h, x.a0, x.size, total});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;
@@ -1768,7 +1854,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     for (const Window& x : sc.win) {
         // a request may run past the end of the file: only the role's own bytes have to arrive
         if ((uint64_t) got[x.req] < x.in_req + x.skip + x.n) return false;
-        std::memcpy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
+        big_copy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
     }
     return true;
 #elif defined(__linux__)

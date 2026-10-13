@@ -47,6 +47,9 @@
 #include <chrono>
 #include <numeric>
 #include <cstring>
+#include <emmintrin.h>
+
+#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -646,6 +649,84 @@ struct SlotHeader {
     int64_t n_cells, n_dsa, lat_row, id, gdn_n, tail_n;
 };
 constexpr char kSlotMagic[8] = {'G', 'L', 'M', '5', 'S', 'L', 'T', '1'};
+
+// 2026-10-14: a blob into the page-locked stage with non-temporal stores (3 -> 2 RAM transfers a byte: the DMA beside
+// it keeps more of the RAM bandwidth - 4 copying threads cost it 46 -> 17 GB/s with memcpy, -> 26 GB/s with these).
+// STRATA_NT_COPY=0: memcpy.
+void stage_copy(uint8_t* d, const uint8_t* s, size_t n) {
+    static const bool nt = [] { const char* v = std::getenv("STRATA_NT_COPY"); return v == nullptr || std::atoi(v) != 0; }();
+    if (nt && n >= (1u << 16)) {
+        const size_t head = (16 - ((uintptr_t) d & 15)) & 15;
+        std::memcpy(d, s, head);
+        d += head; s += head; n -= head;
+        const size_t body = n & ~(size_t) 63;
+        for (size_t i = 0; i < body; i += 64) {
+            const __m128i a = _mm_loadu_si128((const __m128i*) (s + i)), b = _mm_loadu_si128((const __m128i*) (s + i + 16));
+            const __m128i c = _mm_loadu_si128((const __m128i*) (s + i + 32)), e = _mm_loadu_si128((const __m128i*) (s + i + 48));
+            _mm_stream_si128((__m128i*) (d + i), a);
+            _mm_stream_si128((__m128i*) (d + i + 16), b);
+            _mm_stream_si128((__m128i*) (d + i + 32), c);
+            _mm_stream_si128((__m128i*) (d + i + 48), e);
+        }
+        _mm_sfence();
+        std::memcpy(d + body, s + body, n - body);
+        return;
+    }
+    std::memcpy(d, s, n);
+}
+
+// 2026-10-14: the prompt walk's blob fetchers, kept across launches.  A thread made per blob per launch (some 11,600 for
+// an 8K prompt) also made a fresh thread_local read buffer each time (read_direct), every page of it zeroed by the
+// system first - RAM traffic the DMA beside it pays for.  run(n, fn) calls fn(0..n-1) on the workers and waits.
+class FetchCrew {
+public:
+    void run(int n, const std::function<void(int)>& fn) {
+        std::unique_lock<std::mutex> lk(mu_);
+        while ((int) th_.size() < n) th_.emplace_back([this] { loop(); });
+        fn_ = &fn;
+        next_ = 0;
+        n_ = n;
+        left_ = n;
+        ++gen_;
+        cv_.notify_all();
+        done_cv_.wait(lk, [&] { return left_ == 0; });
+        fn_ = nullptr;
+    }
+    ~FetchCrew() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : th_) t.join();
+    }
+
+private:
+    void loop() {
+        uint64_t seen = 0;
+        std::unique_lock<std::mutex> lk(mu_);
+        for (;;) {
+            cv_.wait(lk, [&] { return stop_ || (gen_ != seen && next_ < n_); });
+            if (stop_) return;
+            while (next_ < n_) {
+                const int k = next_++;
+                const std::function<void(int)>* fn = fn_;
+                lk.unlock();
+                (*fn)(k);
+                lk.lock();
+                if (--left_ == 0) done_cv_.notify_all();
+            }
+            seen = gen_;
+        }
+    }
+    std::mutex mu_;
+    std::condition_variable cv_, done_cv_;
+    std::vector<std::thread> th_;
+    const std::function<void(int)>* fn_ = nullptr;
+    int next_ = 0, n_ = 0, left_ = 0;
+    uint64_t gen_ = 0;
+    bool stop_ = false;
+};
 }  // namespace
 
 bool Verifier::glm5_slot_write(const std::string& path, const int32_t* toks, int64_t n_cells, uint64_t fingerprint,
@@ -817,6 +898,34 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     // two halves of the staging ring: the host fills one (threads copy the blobs into page-locked memory, one DMA
     // takes them to the device) while the GPU computes the experts of the other
     uint8_t* stage = (uint8_t*) dalloc((size_t) 2 * B * max_blob);
+    // 2026-10-13 (opt-in, STRATA_GLM5_PF_AHEAD=S): the chunk path (one chunk: a chunk at least the prompt's length) sends
+    // layer l's RAM-tier experts that are not VRAM residents into S slots of their own while layer l's attention runs,
+    // and moe(l) uses them like residents - the expert copies under the attention, as Project Maya's prefill does.  (In
+    // the walk the same prefetch lost: there it shared the one H2D engine with every layer's state-in.)  Prompts of
+    // fewer than STRATA_GLM5_PF_AHEAD_MIN tokens (2,048) do not: they use few of a layer's experts.  S x max_blob of
+    // VRAM: raise --vram-reserve-mib by as much.
+    static const int ahead_env = [] { const char* v = std::getenv("STRATA_GLM5_PF_AHEAD"); return v ? std::max(0, std::atoi(v)) : 0; }();
+    static const int64_t ahead_min = [] { const char* v = std::getenv("STRATA_GLM5_PF_AHEAD_MIN"); return v ? std::atoll(v) : 2048; }();
+    int ahead_n = ahead_env;
+    uint8_t* ahead = ahead_n > 0 ? (uint8_t*) dalloc((size_t) ahead_n * max_blob) : nullptr;
+    if (ahead_n > 0 && ahead == nullptr) {
+        std::fprintf(stderr, "strata glm5 prefill: no VRAM for %d look-ahead slots (%zu MiB) - off for this prompt\n", ahead_n,
+                     ((size_t) ahead_n * max_blob) >> 20);
+        ahead_n = 0;
+    }
+    std::vector<int32_t> ahead_slot;
+    int64_t ahead_layer = -1, ahead_count = 0;
+    cudaStream_t ahead_s = nullptr;
+    cudaEvent_t ev_ahead_done = nullptr, ev_ahead_free = nullptr;
+    if (ahead_n > 0) {
+        cudaStreamCreateWithFlags(&ahead_s, cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&ev_ahead_done, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&ev_ahead_free, cudaEventDisableTiming);
+    }
+    struct AheadGuard {
+        cudaStream_t s; cudaEvent_t a, b;
+        ~AheadGuard() { if (s) { cudaStreamSynchronize(s); cudaStreamDestroy(s); } if (a) cudaEventDestroy(a); if (b) cudaEventDestroy(b); }
+    } ahead_guard{ahead_s, ev_ahead_done, ev_ahead_free};
     unsigned long long* dptr = (unsigned long long*) dalloc((size_t) 2 * B * 8);
     const int64_t plan_n = (B + 1) + 2 * CK + 1;
     int32_t* dplan = (int32_t*) dalloc((size_t) 2 * plan_n * 4);
@@ -1286,6 +1395,15 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         for (int32_t e = 0; e < (int32_t) NE; ++e)
             if (!(f.host_res && f.host_res[(size_t) ln * NE + e] >= 0) && f.ram(f.ctx, ln, e) == nullptr) list->push_back(e);
         if (list->empty()) return;
+        // 2026-10-13 (STRATA_GLM5_PF_STAGE=1): the source's own read-ahead instead - unbuffered, overlapped reads into
+        // its stage buffers on its thread.  nsys, 7,910 tokens with the experts under the attention: the walk then
+        // waited 23 times ~152 ms here for this touch (a first touch of a mapped file is one lane, ~2 GB/s)
+        static const bool pf_stage = [] { const char* v = std::getenv("STRATA_GLM5_PF_STAGE"); return v && v[0] == '1'; }();
+        if (pf_stage && f.prefetch) {
+            std::vector<int64_t> l64(list->begin(), list->end());
+            f.prefetch(f.ctx, ln, l64.data(), (int64_t) l64.size());
+            return;
+        }
         auto next = std::make_shared<std::atomic<size_t>>(0);
         const uint64_t bbn = lay.blob_bytes(ln);
         for (int w = 0; w < pf_touch_th; ++w)
@@ -1312,6 +1430,28 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             return;
         glm5_f32_gemv((const float*) wr->data, xmc, logc, (int) N, (int) NE, (int) T, 1.0f, cs);
     };
+    // STRATA_GLM5_PF_AHEAD: layer l's RAM-tier, non-resident experts (expert order, up to ahead_n) onto ahead_s, after
+    // everything queued on cs so far (moe(l - 1) read the slots last); called before layer l's attention is queued
+    auto send_ahead = [&](int64_t l, int64_t T) {
+        ahead_layer = -1;
+        if (ahead_n <= 0 || T < ahead_min || l < g.n_dense_layers || !f.ram) return;
+        ahead_slot.assign((size_t) NE, -1);
+        const uint64_t bbl = lay.blob_bytes(l);
+        cudaEventRecord(ev_ahead_free, cs);
+        cudaStreamWaitEvent(ahead_s, ev_ahead_free, 0);
+        int k = 0;
+        for (int32_t e = 0; e < NE && k < ahead_n; ++e) {
+            if (f.host_res && f.host_res[(size_t) l * NE + e] >= 0) continue;
+            const uint8_t* hb = f.ram(f.ctx, l, e);
+            if (hb == nullptr) continue;
+            cudaPointerAttributes at{};
+            if (cudaPointerGetAttributes(&at, hb) != cudaSuccess || at.type != cudaMemoryTypeHost) { cudaGetLastError(); continue; }
+            cudaMemcpyAsync(ahead + (size_t) k * max_blob, hb, (size_t) bbl, cudaMemcpyHostToDevice, ahead_s);
+            ahead_slot[(size_t) e] = k++;
+        }
+        cudaEventRecord(ev_ahead_done, ahead_s);
+        ahead_layer = l;
+    };
     auto moe = [&](int64_t l, int64_t T) -> bool {
         touch_next(l + 1, T);
         const WeightRef *wr = wfind(wt, l, "ffn_gate_inp.weight", err), *wb = wfind(wt, l, "exp_probs_b.bias", err),
@@ -1334,6 +1474,9 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         cudaMemcpyAsync(h_ids.data(), idsc, (size_t) TK * 4, cudaMemcpyDeviceToHost, cs);
         const auto tm0 = std::chrono::steady_clock::now();
         if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "verify glm5 prefill: the router failed on the GPU"; return false; }
+        const bool ahead_here = ahead_layer == l;
+        if (ahead_here) cudaStreamWaitEvent(cs, ev_ahead_done, 0);   // the look-ahead slots have landed
+        auto ahead_of = [&](int32_t e) { return ahead_here ? ahead_slot[(size_t) e] : -1; };
         auto tm = std::chrono::steady_clock::now();
         auto mlap2 = [&](int i) {
             const auto t1 = std::chrono::steady_clock::now();
@@ -1480,26 +1623,30 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             int32_t stream_e[32];
             int entries = 0, max_rows = 0;
             // the streamed experts first (staging slots 0..ns-1, as the DMA below fills them), then the residents: with
-            // MMQ each resident is copied into the next slot, so every expert of the launch is max_blob apart
+            // MMQ each resident is copied into the next slot, so every expert of the launch is max_blob apart (a
+            // look-ahead one counts as a resident)
             int ord[32], no = 0;
             for (int pass = 0; pass < 2; ++pass)
                 for (int j = 0; j < nb; ++j) {
                     const int32_t e = used[b0 + (size_t) j];
-                    const bool res = f.host_res && f.host_res[(size_t) l * NE + e] >= 0;
+                    const bool res = (f.host_res && f.host_res[(size_t) l * NE + e] >= 0) || ahead_of(e) >= 0;
                     if (res == (pass == 1)) ord[no++] = j;
                 }
             for (int q = 0; q < nb; ++q) {
                 const int32_t e = used[b0 + (size_t) ord[q]];
                 const int32_t slot = f.host_res ? f.host_res[(size_t) l * NE + e] : -1;
-                if (slot >= 0) {
-                    const uint8_t* src = f.cache_base + (f.slot_off ? (size_t) f.slot_off[slot] : (size_t) slot * f.cache_blob);
+                const int32_t as = slot >= 0 ? -1 : ahead_of(e);
+                if (slot >= 0 || as >= 0) {
+                    const uint8_t* src = as >= 0 ? ahead + (size_t) as * max_blob
+                                                 : f.cache_base + (f.slot_off ? (size_t) f.slot_off[slot] : (size_t) slot * f.cache_blob);
                     if (mm) {
                         cudaMemcpyAsync(dstage + (size_t) q * max_blob, src, (size_t) bb, cudaMemcpyDeviceToDevice, cs);
                         hptr[q] = (unsigned long long) (dstage + (size_t) q * max_blob);
                     } else {
                         hptr[q] = (unsigned long long) src;
                     }
-                    ++prefill_resident;
+                    if (as >= 0) ++ahead_count;
+                    else ++prefill_resident;
                 } else {
                     hptr[q] = (unsigned long long) (dstage + (size_t) ns * max_blob);
                     stream_e[ns++] = e;
@@ -1540,7 +1687,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                         direct[k] = true;
                     } else {
                         cudaGetLastError();
-                        std::memcpy(hstage + (size_t) k * max_blob, hb, (size_t) bb);
+                        stage_copy(hstage + (size_t) k * max_blob, hb, (size_t) bb);
                     }
                 }
                 for (int k = 0; !serial && k < ns; ++k)
@@ -1555,7 +1702,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                             direct[k] = true;
                         } else {
                             cudaGetLastError();
-                            std::memcpy(hstage + (size_t) k * max_blob, hb, (size_t) bb);
+                            stage_copy(hstage + (size_t) k * max_blob, hb, (size_t) bb);
                         }
                         us_blob += std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
                         us_copy += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - b).count();
@@ -2156,31 +2303,37 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             std::memcpy(e_w, w_sorted.data(), (size_t) entries * 4);
             w_plan_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tpl).count();
             if (ns > 0) {
-                bool failed = false;
-                std::vector<std::thread> th;
-                th.reserve((size_t) ns);
+                std::atomic<bool> failed{false};
                 std::atomic<int64_t> us_blob{0}, us_copy{0};
                 const auto tf = std::chrono::steady_clock::now();
                 std::atomic<bool> direct[32];
                 for (int k = 0; k < ns; ++k) direct[k] = false;
-                for (int k = 0; k < ns; ++k)
-                    th.emplace_back([&, k] {
-                        const auto a = std::chrono::steady_clock::now();
-                        const uint8_t* hb = f.blob ? f.blob(f.ctx, l, stream_e[k]) : nullptr;
-                        const auto b = std::chrono::steady_clock::now();
-                        if (hb == nullptr) { failed = true; return; }
-                        cudaPointerAttributes at{};
-                        if (pf_direct && cudaPointerGetAttributes(&at, hb) == cudaSuccess && at.type == cudaMemoryTypeHost) {
-                            hsrc[k] = hb;
-                            direct[k] = true;
-                        } else {
-                            cudaGetLastError();
-                            std::memcpy(hstage + (size_t) k * max_blob, hb, (size_t) bb);
-                        }
-                        us_blob += std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
-                        us_copy += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - b).count();
-                    });
-                for (auto& t : th) t.join();
+                static const bool pf_crew = [] { const char* v = std::getenv("STRATA_GLM5_PF_CREW"); return v == nullptr || std::atoi(v) != 0; }();
+                const std::function<void(int)> fetch = [&](int k) {
+                    const auto a = std::chrono::steady_clock::now();
+                    const uint8_t* hb = f.blob ? f.blob(f.ctx, l, stream_e[k]) : nullptr;
+                    const auto b = std::chrono::steady_clock::now();
+                    if (hb == nullptr) { failed = true; return; }
+                    cudaPointerAttributes at{};
+                    if (pf_direct && cudaPointerGetAttributes(&at, hb) == cudaSuccess && at.type == cudaMemoryTypeHost) {
+                        hsrc[k] = hb;
+                        direct[k] = true;
+                    } else {
+                        cudaGetLastError();
+                        stage_copy(hstage + (size_t) k * max_blob, hb, (size_t) bb);
+                    }
+                    us_blob += std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+                    us_copy += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - b).count();
+                };
+                if (pf_crew) {
+                    static FetchCrew crew;
+                    crew.run(ns, fetch);
+                } else {
+                    std::vector<std::thread> th;
+                    th.reserve((size_t) ns);
+                    for (int k = 0; k < ns; ++k) th.emplace_back([&, k] { fetch(k); });
+                    for (auto& t : th) t.join();
+                }
                 pf_fetch_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tf).count();
                 pf_blob_thread_ms += (double) us_blob.load() / 1000.0;
                 pf_copy_thread_ms += (double) us_copy.load() / 1000.0;
@@ -2372,6 +2525,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                 if (lb > 0) hand_parts(hand_in, nullptr, T);
                 lap(ms_ffn, tp);
                 for (int64_t l = lb; l < le; ++l) {
+                    send_ahead(l, T);   // STRATA_GLM5_PF_AHEAD: under this layer's attention
                     if (!attn_side(l, T, tp)) return false;
                     if (l < g.n_dense_layers ? !dense_ffn(l, T) : !moe(l, T)) return false;
                     lap(ms_ffn, tp);
@@ -2410,6 +2564,9 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     if (prof && !walk)
         std::fprintf(stderr, "strata glm5 prefill prof: moe - router+shared (GPU) %.0f ms, split %.0f ms, expert loop %.0f ms, "
                      "lane join + combine %.0f ms\n", pf_moe_ms[0], pf_moe_ms[1], pf_moe_ms[2], pf_moe_ms[3]);
+    if (prof && ahead_n > 0)
+        std::fprintf(stderr, "strata glm5 prefill prof: look-ahead - %lld experts used from %d slots\n", (long long) ahead_count,
+                     ahead_n);
     if (prof && pf_cpu_n > 0)
         std::fprintf(stderr, "strata glm5 prefill prof: CPU lane %lld experts, the GPU then waited %.0f ms for it\n",
                      (long long) pf_cpu_n, pf_cpu_join_ms);

@@ -710,6 +710,11 @@ private:
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
+    /// STRATA_MIRROR_DIR: the same files on a second drive, unbuffered (Windows); a request of read_direct goes there
+    /// when the hash of its offset falls under mirror_share_ (of 1024, STRATA_MIRROR_SHARE) - two drives read at once
+    std::vector<void*> mirror_;
+    uint32_t mirror_share_ = 0;
+    void open_mirror(std::string& why);
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }
     static constexpr uint64_t kNoComplement = detail::kNoCacheComplement;
