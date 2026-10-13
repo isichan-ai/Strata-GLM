@@ -42,8 +42,9 @@ reasoning. With it off the short-chat answer is **20 tokens/s**; the prompt spee
 - **Please update if a question is sometimes misread, especially the first one after a start.** The same user
   reported that with the 2026-10-13 evening build the first answer broke and the second and third did not - thank
   you. That pattern is what the third 2026-10-13 update below fixes (clearing the state before a new conversation
-  ran on a stream the computation did not wait for); it was not yet published when they tested. CUDA 13.2 is not
-  the cause (measured, see below).
+  ran on a stream the computation did not wait for); it was not yet published when they tested. We also tried
+  CUDA 13.2 here and found no difference from 12.8 in the answers (details in the 2026-10-13 update below). If you
+  notice anything that depends on the setup, we would be glad to hear it.
 - **The GGUF shards are unmapped once the expert file tier reads unbuffered** (upstream 52a2dd10). With a shard
   mapped, NTFS serves the unbuffered reads of that file one at a time. An 892-token prompt 9.4 -> 7.9 s; the decode
   about 10% faster (same build, interleaved).
@@ -92,8 +93,8 @@ reasoning. With it off the short-chat answer is **20 tokens/s**; the prompt spee
   - **Checked** (RTX 5090, one slot folder): the old build wrote a 4,828-token slot; the new build said
     "1 slot file(s) ... not read" and read the prompt again; a second start of the new build read its own slot
     (4,828 tokens in 135 ms). All 12 answers correct.
-  - **Not the cause** (measured): CUDA 13.2 vs 12.8 and MMQ on vs off change the next-token probabilities no more
-    than running the same settings twice does (mean KL 0.018-0.028 vs 0.014-0.017).
+  - **No difference found in our measurements**: CUDA 13.2 vs 12.8, and MMQ on vs off. The next-token probabilities
+    moved about as much as they do between two runs of the same settings (mean KL 0.018-0.028 vs 0.014-0.017).
   - If the misreading still happens after this, please open an issue with the prompt.
 - **Third update (night): fixes taken from upstream Strata and [Project Maya](https://github.com/mw00/project-maya).**
   - **A new conversation could start from the previous one's state.** Clearing the state, restoring a snapshot and
