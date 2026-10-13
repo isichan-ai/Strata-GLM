@@ -37,6 +37,29 @@ and the same day: prompts at 3-33 tokens/s (86-token prompt 28 s, 4,400 tokens 1
 The "writes" numbers above use **expert skipping** (below), which changes about one token in a hundred on long
 reasoning. With it off the short-chat answer is **20 tokens/s**; the prompt speeds do not depend on it.
 
+### Update 2026-10-14
+
+- **Please update if a question is sometimes misread, especially the first one after a start.** The same user
+  reported that with the 2026-10-13 evening build the first answer broke and the second and third did not - thank
+  you. That pattern is what the third 2026-10-13 update below fixes (clearing the state before a new conversation
+  ran on a stream the computation did not wait for); it was not yet published when they tested. CUDA 13.2 is not
+  the cause (measured, see below).
+- **The GGUF shards are unmapped once the expert file tier reads unbuffered** (upstream 52a2dd10). With a shard
+  mapped, NTFS serves the unbuffered reads of that file one at a time. An 892-token prompt 9.4 -> 7.9 s; the decode
+  about 10% faster (same build, interleaved).
+- **Lighter host copies in the prompt path.** The prompt's real limit is now the RAM bandwidth: a DMA from page-locked
+  RAM makes 46.6 GB/s alone and 17.0 GB/s beside 4 threads running memcpy. The blob copies use non-temporal stores
+  (`STRATA_NT_COPY=0`: memcpy) and the blob fetchers are kept across launches (`STRATA_GLM5_PF_CREW=0`: the old
+  threads). 4,829 tokens 8.3-8.7 -> 7.5-7.6 s; the decode unchanged.
+- **Optional: the expert file tier on two drives** (`STRATA_MIRROR_DIR=<folder>`: a copy of the GGUF shards on a
+  second drive; `STRATA_MIRROR_SHARE` = its share of the reads, default 0.5). Each read goes to one of the two, so
+  both drives read at once (here 4.0 + 6.9 = 10.9 GB/s). With an 80 GiB RAM tier: start 66 -> 43 s, a short prompt
+  4.1 -> 2.4 s, the decode after a 360-token follow-up +15% and after a 7,910-token prompt +25%.
+- **Optional: look-ahead in the prompt** (`STRATA_GLM5_PF_AHEAD=256` with `STRATA_GLM5_PREFILL=8192`,
+  `--vram-reserve-mib 10000`, `STRATA_GLM5_PF_TOUCH=32`): 7,910 tokens 10.1 -> 8.3 s, but that reserve costs the
+  decode 6-7%, and with less reserve the 8192 chunk falls off a cliff (6,400 MiB: 263 s). For long-prompt work only.
+- Checked (RTX 5090): over 50 answers correct across the default settings and the two-drive one.
+
 ### Update 2026-10-13
 
 - **Fix: answers that were sometimes nothing but "!!!!" (please update).** A user reported that answers broke at
