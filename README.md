@@ -72,6 +72,21 @@ reasoning. With it off the short-chat answer is **20 tokens/s**; the prompt spee
   - **Not the cause** (measured): CUDA 13.2 vs 12.8 and MMQ on vs off change the next-token probabilities no more
     than running the same settings twice does (mean KL 0.018-0.028 vs 0.014-0.017).
   - If the misreading still happens after this, please open an issue with the prompt.
+- **Third update (night): fixes taken from upstream Strata and [Project Maya](https://github.com/mw00/project-maya).**
+  - **A new conversation could start from the previous one's state.** Clearing the state, restoring a snapshot and
+    reading a slot file ran on a different GPU stream from the computation, which did not wait for them, so the next
+    prompt could read the old state while it was still being overwritten. This is another likely cause of the
+    misread questions (Maya found the same pattern answering another conversation's question). They now run on the
+    compute stream and are waited for.
+  - **NaN guard** (after upstream #879): every window's output is checked; a window with NaN / Inf sends none of its
+    tokens, the reply ends ("nonfinite"), and the state, the snapshot and the slot files that held it are dropped,
+    so the next request starts clean. Its cost is within run-to-run noise. `STRATA_NAN_GUARD=0` turns it off.
+  - **GLM's tool tags inside a message are text** (`<tool_call>`, `<arg_key>`, `<arg_value>`, `<tool_response>` and
+    their closing tags; upstream #2026 widened as Maya does): a file or a message containing them no longer ends the
+    model's tool call or reply.
+  - From upstream: a tool list sent in another order keeps its first order (the prompt cache survives, #1624), and a
+    keep-alive is sent while a long tool argument is being written (client timeouts, #1666).
+  - Checked (RTX 5090): 28 answers correct over 7 starts, including a forced NaN window; the server tests pass (284).
 
 ### Update 2026-10-11
 
