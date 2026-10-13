@@ -246,9 +246,15 @@ public:
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
     double busy_ms() const { return (double) busy_us_.load(std::memory_order_relaxed) / 1000.0; }
+    /// 2026-10-14 (a count only): the file-tier experts the CPU then needed at `layer`, against the last prediction
+    /// for that layer - printed when the look-ahead stops
+    void score(int64_t layer, const int64_t* need, int64_t n);
 
 private:
     void run();
+    std::mutex last_mu_;
+    std::vector<std::vector<int64_t>> last_;   ///< the last prediction per layer (score)
+    std::atomic<int64_t> need_{0}, hit_{0}, guessed_{0};
     std::vector<std::vector<uint16_t>> routers_;
     std::vector<std::vector<float>> bias_f_;   ///< start_f32 (glm5); an empty routers_[l] = a dense layer
     int64_t n_layers_ = 0;

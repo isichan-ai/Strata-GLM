@@ -5206,6 +5206,9 @@ int main(int argc, char** argv) {
     // read into the stage buffers ahead of the CPU (the unbuffered reads cannot warm pages).  Opt-in, STRATA_LOOKAHEAD=1:
     // measured neutral (2026-10-08, 5090 + 100 GiB RAM tier, 3 runs each: 9.60 on / 9.73 off tok/s) - a layer's CPU
     // share takes ~1.2 ms, the next layer's misses take several ms to read, so the reads only add SSD traffic.
+    // Again 2026-10-14 (80 GiB RAM tier, two drives at 10.9 GB/s, "strata look-ahead:" counts at exit): k=12 predicts
+    // 72% of the file-tier experts the CPU then needs but reads 4.4x as many (chat 27 -> 22 tok/s); k=5 55% at 1.1x,
+    // k=3 36% at 0.5x - the decode no faster either way (the prediction runs on the CPU the experts need).
     // STRATA_LOOKAHEAD_K: experts predicted per token (default 12 = top-8 and a margin)
     if (glm5_model && srcp == &src && [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v != nullptr && std::atoi(v) != 0; }()) {
         std::vector<std::vector<float>> routers((size_t) g.n_layers), bias((size_t) g.n_layers);

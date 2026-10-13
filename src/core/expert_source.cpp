@@ -2059,6 +2059,24 @@ RouterLookahead::~RouterLookahead() {
     }
     rd_cv_.notify_all();
     if (reader_.joinable()) reader_.join();
+    if (need_.load() > 0)
+        std::fprintf(stderr, "strata look-ahead: the CPU needed %lld file-tier experts, %lld of them predicted (%.1f%%); "
+                     "%lld file-tier experts predicted in all; %lld submissions skipped\n",
+                     (long long) need_.load(), (long long) hit_.load(), 100.0 * (double) hit_.load() / (double) need_.load(),
+                     (long long) guessed_.load(), (long long) skipped_.load());
+}
+
+void RouterLookahead::score(int64_t layer, const int64_t* need, int64_t n) {
+    const auto* fs = dynamic_cast<const FileExpertSource*>(src_);
+    std::lock_guard<std::mutex> lk(last_mu_);
+    if (layer < 0 || layer >= (int64_t) last_.size()) { need_ += n; return; }
+    std::vector<int64_t>& p = last_[(size_t) layer];
+    for (int64_t i = 0; i < n; ++i)
+        if (std::find(p.begin(), p.end(), need[i]) != p.end()) ++hit_;
+    need_ += n;
+    for (const int64_t e : p)
+        if (fs != nullptr && !fs->has_resident(layer, e)) ++guessed_;
+    p.clear();   // scored once: a later window predicts again
 }
 
 void RouterLookahead::set_foresight(ForesightSwap* fs) {
@@ -2233,6 +2251,11 @@ void RouterLookahead::run() {
                 rd_pending_ = true;
             }
             rd_cv_.notify_one();
+        }
+        {
+            std::lock_guard<std::mutex> lk(last_mu_);
+            if ((int64_t) last_.size() < n_layers_) last_.resize((size_t) n_layers_);
+            last_[(size_t) layer] = want;
         }
         if (fs != nullptr && dj == 0)   // the next layer only: a deeper guess is too often wrong to spend a copy on
             for (const int64_t e : want) fs->predict(src_, layer, (int32_t) e);
@@ -3678,6 +3701,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         g_cpu_experts += (int64_t) miss.size();
         g_cpu_bytes += (uint64_t) miss.size() * lay.blob_bytes(d.layers);
         g_cpu_rows += rows;
+        if (d.lookahead != nullptr) {   // 2026-10-14: how many of this layer's file-tier needs the look-ahead predicted
+            static thread_local std::vector<int64_t> need;
+            need.clear();
+            const auto* nfs = dynamic_cast<const FileExpertSource*>(d.src);
+            for (const int64_t e : miss)
+                if (nfs != nullptr && !nfs->has_resident(d.layers, e)) need.push_back(e);
+            d.lookahead->score(d.layers, need.data(), (int64_t) need.size());
+        }
         const auto p0 = std::chrono::steady_clock::now();
         if (split_file) d.src->prefetch_async(d.layers, miss.data(), (int64_t) miss.size());
         else d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
