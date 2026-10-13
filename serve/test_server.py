@@ -2253,6 +2253,42 @@ class CancelledRead(unittest.TestCase):
         self.assertEqual(m["totals"]["prompt_tokens"], 8 + 2 * total)
 
 
+class HeldBackArgKeepalive(unittest.TestCase):
+    """#1666: with stream_tools a tool call's array or object argument is held until it is whole, so a big one
+    left the stream silent for minutes while tokens were generated - a client's idle timeout (Forge's is 120 s)
+    then ended a healthy request.  The token loop now sends the engine's own keep-alive ping whenever nothing has
+    gone out for KEEPALIVE_S; a quick answer is untouched."""
+
+    TOOLS = [{"name": "f", "parameters": {"properties": {}}}]
+
+    def test_a_held_back_call_still_pings(self):
+        tok = ByteTokenizer()
+        clock = [0.0]
+
+        class HeldEngine(MockEngine):   # ~1 s to generate each token, none of it leaving the stream
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                for t in super().generate(ids, max_new, sampling, cancel):
+                    clock[0] += 1.0
+                    yield t
+
+        # a call inside the thinking is held whole until </tool_call> (the frontend's rcall state): every token
+        # after the opener produces no stream event - the same silence a long array argument makes
+        svc = Service(HeldEngine(tok, "<tool_call><function=f>" + "x" * 30, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with mock.patch("serve.server.time.perf_counter", lambda: clock[0]):
+            kinds = [k for k, _ in svc.run(tok.encode("hi"), True, self.TOOLS, 60, {}, threading.Event())]
+        self.assertIn("ping", kinds)
+        self.assertIn("done", kinds)
+
+    def test_an_ordinary_answer_does_not_ping(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        kinds = [k for k, _ in svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event())]
+        self.assertNotIn("ping", kinds)
+        self.assertIn("done", kinds)
+
+
 class LiveRate(unittest.TestCase):
     """The Monitor's Speed readout: live.tok_s is a rate, and a request that never got a DONE keeps no counters.
 
@@ -4826,6 +4862,36 @@ class ClaudeCodeBillingStamp(unittest.TestCase):
         first = svc.encode_prompt(*anthropic_to_messages({"system": self.blocks(c="b145e"), "messages": turn1,
                                                          "tools": tools}))
         self.assertEqual(ids[1][:len(first) - 8], first[:len(first) - 8])   # all but the generation header
+
+
+class ToolOrder(unittest.TestCase):
+    """A tool set that comes back in another order is put back in the order it was first seen (RealScaniX, #1624): the
+    template renders the tool list before the system prompt, so a client whose MCP tools register in a varying order
+    would move the shared prefix back thousands of tokens on every turn and have the conversation read again.  The
+    first request of a set is left exactly as sent."""
+
+    def names(self, tools, wrapper="function"):
+        from serve.frontend import _tool_list
+        return [t.get(wrapper, t)["name"] for t in _tool_list(tools, wrapper)]
+
+    def test_openai_shape_keeps_the_first_order(self):
+        a = [{"type": "function", "function": {"name": n}} for n in ("t1624_read", "t1624_rbash", "t1624_ctx7")]
+        self.assertEqual(self.names(a), ["t1624_read", "t1624_rbash", "t1624_ctx7"])      # the first sight: as sent
+        self.assertEqual(self.names(list(reversed(a))), ["t1624_read", "t1624_rbash", "t1624_ctx7"])
+        self.assertEqual(self.names(a[1:] + a[:1]), ["t1624_read", "t1624_rbash", "t1624_ctx7"])
+
+    def test_anthropic_shape_and_a_different_set(self):
+        a = [{"name": "t1624_read", "input_schema": {}}, {"name": "t1624_edit", "input_schema": {}}]
+        self.assertEqual(self.names(a, None), ["t1624_read", "t1624_edit"])
+        self.assertEqual(self.names(a[::-1], None), ["t1624_read", "t1624_edit"])
+        more = a[::-1] + [{"name": "t1624_new", "input_schema": {}}]       # another set: as sent, then remembered
+        self.assertEqual(self.names(more, None), ["t1624_edit", "t1624_read", "t1624_new"])
+
+    def test_duplicate_names_and_one_tool_are_left_alone(self):
+        d = [{"name": "t1624_x", "input_schema": {}}, {"name": "t1624_x", "input_schema": {"a": 1}}]
+        self.assertEqual(self.names(d, None), ["t1624_x", "t1624_x"])
+        one = [{"name": "t1624_only", "input_schema": {}}]
+        self.assertEqual(self.names(one, None), ["t1624_only"])
 
 
 class UntimedReads(unittest.TestCase):

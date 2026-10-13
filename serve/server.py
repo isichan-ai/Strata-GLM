@@ -196,7 +196,8 @@ def focused_recovery_prompt(tok, ids, generated):
 
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
-CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often (#1666)
+CTX_SLACK = 8              # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -3507,9 +3508,15 @@ class Service:
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
+                            # upstream #1666 (14b9dd2e): a value the frontend holds back (a tool call's array or object
+                            # argument is sent whole, once complete) can keep the stream silent for minutes while
+                            # tokens are generated; a client's idle timeout then ends the request.  Send the same
+                            # keep-alive the engine's heartbeat sends when nothing has gone out for KEEPALIVE_S.
+                            last_out = time.perf_counter()
                             for t in gen:
                                 if t is None:               # heartbeat while the engine is quiet
                                     last_print = self._progress(last_print, st=st)
+                                    last_out = time.perf_counter()
                                     yield "ping", None
                                     continue
                                 n += 1
@@ -3539,6 +3546,11 @@ class Service:
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
                                     yield "event", ev
+                                if evs:
+                                    last_out = time.perf_counter()
+                                elif time.perf_counter() - last_out >= KEEPALIVE_S:
+                                    last_out = time.perf_counter()
+                                    yield "ping", None
                                 if stops is not None and stops.hit is not None:
                                     finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
                                     break

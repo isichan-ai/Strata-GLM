@@ -19,7 +19,9 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -204,7 +206,15 @@ THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
 # the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
 VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
                "<|video_pad|>": "\U000F0E06"}
-LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
+# upstream #2026 (a6830008): `</tool_call>` the same way.  A user asking for the string verbatim handed the model the
+# real end-of-call token (type 4, matched everywhere); it copied that token into its answer and the reply came back
+# empty.  2026-10-13, GLM: all of GLM-5's tool tags are type 4 too (`<arg_key>` in a file an agent reads ended a
+# call's argument there).  An assistant message keeps its own: a client replaying the model's raw call text sends the
+# tokens the model wrote.
+TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07", "<tool_call>": "\U000F0E08", "<arg_key>": "\U000F0E09",
+                     "</arg_key>": "\U000F0E0A", "<arg_value>": "\U000F0E0B", "</arg_value>": "\U000F0E0C",
+                     "<tool_response>": "\U000F0E0D", "</tool_response>": "\U000F0E0E"}
+LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS}
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
 
@@ -254,17 +264,19 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
     if not _has_tag(messages, tags) and not _has_tag(tools, tags):
         return messages, tools, False
     out = []
+    own = {t: v for t, v in tags.items() if t not in TOOL_LITERAL_TAGS}     # what an assistant message keeps as written
     for m in messages:
         m = dict(m)
         content = m.get("content")
+        mine = own if m.get("role") == "assistant" else tags
         for k, v in m.items():
             if k != "role":
-                m[k] = _mark_deep(v, tags)
+                m[k] = _mark_deep(v, mine)
         if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
                 and "</think>" in content:
             i, j = content.index("<think>") + len("<think>"), content.index("</think>")
-            m["content"] = (content[:i] + _mark(content[i:j], tags) + "</think>" +
-                            _mark(content[j + len("</think>"):], tags))
+            m["content"] = (content[:i] + _mark(content[i:j], own) + "</think>" +
+                            _mark(content[j + len("</think>"):], own))
         out.append(m)
     return out, _mark_deep(tools, tags), True
 
@@ -315,6 +327,36 @@ def _object_list(value, name: str) -> list[dict]:
     return value
 
 
+_TOOL_ORDERS: "OrderedDict[frozenset, tuple]" = OrderedDict()   # a set of tool names -> the order it first came in
+_TOOL_ORDERS_LOCK = threading.Lock()
+_TOOL_ORDERS_MAX = 64
+
+
+def _stable_tool_order(tools: list[dict], name_of) -> list[dict]:
+    """The same set of tools comes back in the order it was first seen.  Clients send their tools in the order their
+    MCP servers finished registering, which can differ from one request (or one client restart) to the next, and the
+    template renders the tool list before the system prompt: one swap moves the shared prefix back thousands of
+    tokens and the whole conversation is read again (opencode issue 23571).  A request's first sight of a tool set
+    is untouched (so its prompt is byte for byte what the client sent); later requests with the same names in
+    another order are put back in that first order.  Duplicate names, or a single tool: left as sent."""
+    if len(tools) < 2:
+        return tools
+    names = [name_of(t) for t in tools]
+    if len(set(names)) != len(names):
+        return tools
+    key = frozenset(names)
+    with _TOOL_ORDERS_LOCK:
+        order = _TOOL_ORDERS.get(key)
+        if order is None:
+            _TOOL_ORDERS[key] = tuple(names)
+            while len(_TOOL_ORDERS) > _TOOL_ORDERS_MAX:
+                _TOOL_ORDERS.popitem(last=False)
+            return tools
+        _TOOL_ORDERS.move_to_end(key)
+    pos = {n: k for k, n in enumerate(order)}
+    return sorted(tools, key=lambda t: pos[name_of(t)])
+
+
 def _tool_list(value, wrapper: str | None) -> list[dict]:
     """#592: a request's "tools" as a list of tool objects, each with a name - in the OpenAI shape
     {"type": "function", "function": {"name": ...}} (`wrapper` "function"; a bare {"name": ...} is still taken), or
@@ -342,7 +384,7 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
             # AttributeError in the request thread - after the 200 and whatever the model had said before the call
             raise ValueError(f'tools[{i}] ({fn["name"]}): "{key}" must be an object (the JSON schema of its '
                              f"parameters), not {type(schema).__name__}")
-    return tools
+    return _stable_tool_order(tools, lambda t: (t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t)["name"])
 
 
 def tool_arguments(raw) -> dict:
