@@ -2123,6 +2123,30 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    // 2026-10-13, GLM serve's NaN guard (after upstream #879): a window whose head logits hold a NaN / Inf picks token
+    // 0 ('!') and its state is poisoned; the caller drops that window and the state (generate.cpp).  One small kernel
+    // and a sync after the window's own: ~0.1% of a ~33 ms window.  STRATA_NAN_GUARD=0: off; STRATA_NAN_INJECT=n: the
+    // n-th checked window reports row 0 (a test of the caller's handling)
+    nonfinite_row = -1;
+    static const bool nan_guard = [] { const char* v = std::getenv("STRATA_NAN_GUARD"); return !(v && v[0] == '0'); }();
+    if (glm_ != nullptr && nan_guard && T <= kVerifyMaxT) {
+        if (h_nf_ == nullptr &&
+            (cudaHostAlloc((void**) &h_nf_, (size_t) kVerifyMaxT * strata::kernels::kNonfiniteBlocks * 4, cudaHostAllocMapped) !=
+                 cudaSuccess ||
+             cudaHostGetDevicePointer((void**) &m_nf_, h_nf_, 0) != cudaSuccess)) {
+            (void) cudaGetLastError();
+            h_nf_ = m_nf_ = nullptr;
+        }
+        if (h_nf_ != nullptr) {
+            strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs_);
+            if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify: the NaN check failed"; return false; }
+            for (int i = 0; i < T * strata::kernels::kNonfiniteBlocks && nonfinite_row < 0; ++i)
+                if (((volatile int32_t*) h_nf_)[i] != 0) nonfinite_row = i / strata::kernels::kNonfiniteBlocks;
+            static int64_t checked = 0;
+            static const int64_t inject = [] { const char* v = std::getenv("STRATA_NAN_INJECT"); return v ? std::atoll(v) : 0; }();
+            if (++checked == inject) nonfinite_row = 0;
+        }
+    }
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
         if (!reported) {

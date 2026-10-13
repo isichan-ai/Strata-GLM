@@ -117,6 +117,9 @@ public:
     }
     /// Counters of the rejection path (windows judged, drafts kept / offered over its rows with a q list).
     int64_t spec_windows = 0;
+    // 2026-10-13, GLM serve's NaN guard (after upstream #879): the last run()'s head logits had a non-finite value
+    // (its row; -1: none).  Checked after the window's own sync, glm5 windows only; STRATA_NAN_GUARD=0: off
+    int nonfinite_row = -1;
 
     /// Off: `run` skips the request's head sampling and `out` is the recorded greedy pick.  For windows whose
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
@@ -485,6 +488,7 @@ private:
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
+    int32_t* h_nf_ = nullptr;    int32_t* m_nf_ = nullptr;      // the NaN guard's flags (mapped, allocated on first use)
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k

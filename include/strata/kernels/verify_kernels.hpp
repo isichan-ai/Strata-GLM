@@ -131,6 +131,10 @@ bool multi_block_head_ops();
 /// True where the verify head's and the draft's greedy pick should be argmax_rows: sm_80 to sm_89 (the one-block
 /// kernel is slow there; sm_90+ has sample_tokens' cluster kernel, other cards keep sample_tokens).
 bool argmax_rows_wanted();
+/// 2026-10-13 (GLM serve's NaN guard, after upstream #879): flags[row * kNonfiniteBlocks + b] = 1 where block b of
+/// `row` saw a non-finite logit, else 0 - every word written, so no clearing between launches.
+constexpr int kNonfiniteBlocks = 16;
+void logits_nonfinite_rows(const float* logits, int n_rows, int n, int32_t* flags, void* stream);
 /// Dense-attention step records for `n` cells: [cell, cell+1, (cell+1)/4, cell+1] from cells[i] (device memory).
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// A sliding attention window: for `n` step records (kStepCount ints each, n_kv at [1]) the selection becomes the

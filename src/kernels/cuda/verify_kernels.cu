@@ -1476,4 +1476,23 @@ bool pdl_launch_ok(const void* kernel, cudaStream_t stream) {
 }
 #endif
 
+namespace {
+__global__ void logits_nonfinite_rows_kernel(const float* __restrict__ logits, int n, int32_t* __restrict__ flags) {
+    const int row = (int) blockIdx.y, b = (int) blockIdx.x;
+    const int per = (n + kNonfiniteBlocks - 1) / kNonfiniteBlocks, v0 = b * per, v1 = min(n, v0 + per);
+    const float* x = logits + (size_t) row * (size_t) n;
+    int bad = 0;
+    for (int v = v0 + (int) threadIdx.x; v < v1; v += (int) blockDim.x) bad |= !isfinite(x[v]);
+    bad = __syncthreads_or(bad);
+    if (threadIdx.x == 0) flags[row * kNonfiniteBlocks + b] = bad;
+}
+}  // namespace
+
+void logits_nonfinite_rows(const float* logits, int n_rows, int n, int32_t* flags, void* stream) {
+    if (n_rows <= 0) return;
+    logits_nonfinite_rows_kernel<<<dim3((unsigned) kNonfiniteBlocks, (unsigned) n_rows), 256, 0, (cudaStream_t) stream>>>(
+        logits, n, flags);
+    check("logits_nonfinite_rows");
+}
+
 }  // namespace strata::kernels

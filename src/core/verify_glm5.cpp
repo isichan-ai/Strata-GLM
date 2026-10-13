@@ -604,9 +604,13 @@ bool Verifier::glm5_state_restore(const std::vector<float>& host, std::string& e
     const OnDevice on_device(device_);
     const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, g_->n_qsa_layers(), glm_->ID);
     if (host.size() != s.gdn_n + s.tail_n) { err = "glm5 state: a snapshot of another size"; return false; }
+    // 2026-10-13: on cs_ and waited for.  A cudaMemcpy from pageable memory may return before its DMA lands, and cs_
+    // (non-blocking) does not wait for the legacy stream - the next prompt could read the previous conversation's
+    // state (Project Maya 4f1f4d7 saw a reply to another conversation's question)
     cudaStreamSynchronize(cs_);
-    if (cudaMemcpy(s.gdn, host.data(), s.gdn_n * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(s.tail, host.data() + s.gdn_n, s.tail_n * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+    if (cudaMemcpyAsync(s.gdn, host.data(), s.gdn_n * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
+        cudaMemcpyAsync(s.tail, host.data() + s.gdn_n, s.tail_n * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
+        cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = "glm5 state: restore failed";
         return false;
     }
@@ -620,7 +624,10 @@ bool Verifier::glm5_state_zero(std::string& err) {
     const OnDevice on_device(device_);
     const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, g_->n_qsa_layers(), glm_->ID);
     cudaStreamSynchronize(cs_);
-    if (cudaMemset(s.gdn, 0, s.gdn_n * 4) != cudaSuccess || cudaMemset(s.tail, 0, s.tail_n * 4) != cudaSuccess) {
+    // on cs_ and waited for (2026-10-13): a cudaMemset on the legacy stream can still be running when cs_ starts the
+    // next prompt, which then reads the previous conversation's state
+    if (cudaMemsetAsync(s.gdn, 0, s.gdn_n * 4, cs_) != cudaSuccess || cudaMemsetAsync(s.tail, 0, s.tail_n * 4, cs_) != cudaSuccess ||
+        cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = "glm5 state: zero failed";
         return false;
     }
@@ -719,16 +726,18 @@ bool Verifier::glm5_slot_read(const std::string& path, uint64_t fingerprint, std
     std::vector<uint8_t> buf(std::max<size_t>({s.gdn_n * 4, s.tail_n * 4, (size_t) nD * lat_bytes,
                                                (size_t) nD * pool_bytes}));
     cudaStreamSynchronize(cs_);
+    // each copy on cs_ and waited for before buf is reused (2026-10-13; see glm5_state_restore)
+    auto landed = [&](cudaError_t e) { return e == cudaSuccess && cudaStreamSynchronize(cs_) == cudaSuccess; };
     bool ok = std::fread(buf.data(), 4, s.gdn_n, f) == s.gdn_n &&
-              cudaMemcpy(s.gdn, buf.data(), s.gdn_n * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+              landed(cudaMemcpyAsync(s.gdn, buf.data(), s.gdn_n * 4, cudaMemcpyHostToDevice, cs_));
     ok = ok && std::fread(buf.data(), 4, s.tail_n, f) == s.tail_n &&
-         cudaMemcpy(s.tail, buf.data(), s.tail_n * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+         landed(cudaMemcpyAsync(s.tail, buf.data(), s.tail_n * 4, cudaMemcpyHostToDevice, cs_));
     ok = ok && std::fread(buf.data(), 1, (size_t) nD * lat_bytes, f) == (size_t) nD * lat_bytes &&
-         cudaMemcpy2D(m.latent, (size_t) m.max_cells * m.lat_row, buf.data(), lat_bytes, lat_bytes, (size_t) nD,
-                      cudaMemcpyHostToDevice) == cudaSuccess;
+         landed(cudaMemcpy2DAsync(m.latent, (size_t) m.max_cells * m.lat_row, buf.data(), lat_bytes, lat_bytes,
+                                  (size_t) nD, cudaMemcpyHostToDevice, cs_));
     ok = ok && std::fread(buf.data(), 1, (size_t) nD * pool_bytes, f) == (size_t) nD * pool_bytes &&
-         cudaMemcpy2D(m.pooled, pool_pitch, buf.data(), pool_bytes, pool_bytes, (size_t) nD,
-                      cudaMemcpyHostToDevice) == cudaSuccess;
+         landed(cudaMemcpy2DAsync(m.pooled, pool_pitch, buf.data(), pool_bytes, pool_bytes, (size_t) nD,
+                                  cudaMemcpyHostToDevice, cs_));
     std::fclose(f);
     if (!ok) { err = "glm5 slot: reading " + path + " failed"; return false; }
     return true;

@@ -13288,6 +13288,7 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 // the prompt's cells [reused, n - 1)
                 bool cancelled = false;
+                bool poisoned = false;   // 2026-10-13: a window's head logits were non-finite (Verifier::nonfinite_row)
                 // STRATA_GLM5_PF_MIN (2026-10-10): the fewest new cells the chunk path takes (16); fewer go as verify windows
                 static const int64_t pf_min = [] { const char* v = std::getenv("STRATA_GLM5_PF_MIN"); return v ? std::atoll(v) : 16; }();
                 // STRATA_GLM5_PF_SEED_ROUNDS (2026-10-10, opt-in): after a prompt of >= 256 new cells, its routing counts go
@@ -13347,6 +13348,11 @@ int main(int argc, char** argv) {
                             std::fflush(stdout);
                             return 1;
                         }
+                        if (ver.nonfinite_row >= 0 && !poisoned) {
+                            poisoned = true;
+                            std::fprintf(stderr, "strata serve: non-finite logits reading the prompt at position %lld "
+                                                 "(row %d)\n", (long long) q, ver.nonfinite_row);
+                        }
                         q += T;
                         cancelled = stop_req.load();
                     }
@@ -13399,7 +13405,8 @@ int main(int argc, char** argv) {
                 strata::spec::SuffixDrafter sd(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
                 if (o.suffix_draft > 0) for (int32_t t : prompt) sd.append(t);
                 std::vector<int32_t> win((size_t) o.spec), outw((size_t) o.spec), sb((size_t) o.spec);
-                while (produced_n < max_new && !cancelled) {
+                if (poisoned) finish = "nonfinite";
+                while (produced_n < max_new && !cancelled && !poisoned) {
                     if (stop_req.load()) { finish = "cancel"; break; }
                     int T = 1;
                     win[0] = xt;
@@ -13421,6 +13428,14 @@ int main(int argc, char** argv) {
                         std::printf("ERR %s\n", err.empty() ? "the expert pool failed" : err.c_str());
                         std::fflush(stdout);
                         return 1;
+                    }
+                    if (ver.nonfinite_row >= 0) {   // none of this window's tokens go out; the state is dropped below
+                        std::fprintf(stderr, "strata serve: non-finite logits at position %lld (row %d): the reply ends "
+                                             "here and the next request reads its prompt from the start\n",
+                                     (long long) pos, ver.nonfinite_row);
+                        poisoned = true;
+                        finish = "nonfinite";
+                        break;
                     }
                     if (adapt_failed) {
                         std::printf("ERR an adaptive refill failed\n");
@@ -13456,6 +13471,27 @@ int main(int argc, char** argv) {
                             (long long) n, prompt_ms, decode_ms, cancelled ? "cancel" : finish, (long long) acc_n,
                             (long long) off_n, (long long) reused, (long long) (n - reused));
                 std::fflush(stdout);
+                if (poisoned) {
+                    // the poison is in the state this request built and in everything saved from it: the live
+                    // sequence, the snapshot, and the slots this prompt starts with (the system part's, the prompt's
+                    // own, one read from disk that may have carried it).  The next request reads from token 0.
+                    live.clear();
+                    snap_toks.clear();
+                    snap.clear();
+                    int dropped = 0;
+                    for (size_t i = 0; i < slots.size();) {
+                        if (starts_with(slots[i].toks)) {
+                            std::error_code ec;
+                            std::filesystem::remove(slots[i].path, ec);
+                            slots.erase(slots.begin() + (ptrdiff_t) i);
+                            ++dropped;
+                        } else {
+                            ++i;
+                        }
+                    }
+                    std::fprintf(stderr, "strata serve: the poisoned state is dropped (live, snapshot, %d slot file(s))\n",
+                                 dropped);
+                }
                 std::fprintf(stderr, "strata serve: request: prompt %lld (reused %lld) in %.0f ms, %lld tokens in %.0f ms "
                                      "(%.2f tok/s), %s\n", (long long) n, (long long) reused, prompt_ms,
                              (long long) produced_n, decode_ms, decode_ms > 0 ? 1000.0 * (double) produced_n / decode_ms : 0.0,
